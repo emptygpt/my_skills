@@ -10,15 +10,21 @@ import tempfile
 from datetime import date
 
 sys.dont_write_bytecode = True
-from rules import BP_LIMITS, DISCLAIMER, METRICS, PERSONAL_GOAL_QUESTION, RED_FLAGS, assessment, medication_note, normalized, trend, triage
+from rules import (
+    BP_LIMITS, DISCLAIMER, EGFR, LDL, LDL_LIMITS, LDL_QUESTION, METRICS, OLDER_AGES, OLDER_ANSWERS,
+    PERSONAL_GOAL_QUESTION, RED_FLAGS, T_SCORE, assessment, confirmed_conditions, medication_notes, normalized, trend, triage,
+)
 
 
-AGE_BANDS = ('18-19', '20-59', '60-79', '80+', '未知')
-PROFILE_FIELDS = {'alias', 'age_band', 'sex', 'conditions', 'medications', 'allergies', 'targets'}
+AGE_BANDS = ('18-19', '20-59', '60-64', '65-79', '60-79', '80+', '未知')
+AGE_QUESTION = '这位家人多大年纪？是否怀孕（女性）？'
+CORE_PROFILE = {'alias', 'age_band', 'sex', 'conditions', 'medications', 'allergies', 'targets'}
+PROFILE_FIELDS = CORE_PROFILE | {'older_diabetes', 'ldl_risk'}
 NAME = re.compile(r'[\u3400-\u9fffA-Za-z0-9 ·＋+（）()\-]{1,40}')
 IDENTIFIER = re.compile(r'[a-z0-9][a-z0-9-]{0,31}')
 SCOPES = ('adult', 'minor', 'pregnant', 'unknown')
 CONSENT = '我确认资料本人已单独同意：仅为本机报告整理与趋势比较，保存代称、年龄段、性别、病史、用药、过敏、医生目标及指标记录；可随时查看、修改、删除。'
+OLDER_CONSENT = '新增保存老年糖尿病分层答案或医生确认的血脂风险档前，再向本人单独说明并征得同意。'
 MAX_BYTES = 2_000_000
 
 
@@ -47,9 +53,9 @@ def read_json(stream):
     return json.loads(data.decode('utf-8'), object_pairs_hook=unique_object)
 
 
-def number(value):
+def number(value, minimum=0):
     require(type(value) is int or type(value) is float and math.isfinite(value), '数值必须是有限数字。')
-    require(0 <= value <= 1_000_000_000, '请核对数值格式和单位。')
+    require(minimum <= value <= 1_000_000_000, '请核对数值格式和单位。')
 
 
 def name(value):
@@ -61,7 +67,7 @@ def unit_for(metric, unit):
 
 
 def check_profile(profile):
-    fields(profile, PROFILE_FIELDS, PROFILE_FIELDS)
+    fields(profile, PROFILE_FIELDS, CORE_PROFILE)
     name(profile['alias'])
     require(profile['age_band'] in AGE_BANDS and profile['sex'] in ('男', '女', '未知'), '年龄段或性别字段不符。')
     for key in ('conditions', 'medications', 'allergies'):
@@ -69,8 +75,17 @@ def check_profile(profile):
         for entry in profile[key]:
             name(entry)
     require(isinstance(profile['targets'], dict), '医生目标须是对象。')
+    if 'older_diabetes' in profile:
+        answers = profile['older_diabetes']
+        fields(answers, OLDER_ANSWERS)
+        require(all(answer in (*OLDER_ANSWERS[key], None) for key, answer in answers.items()), '老年糖尿病分层答案不符；未知请省略。')
+    if 'ldl_risk' in profile:
+        require(profile['ldl_risk'] in (*LDL_LIMITS, None), '血脂风险档仅可录入医生确认的极高危或超高危。')
     for metric, goal in profile['targets'].items():
-        fields(goal, ('op', 'value', 'unit'), ('op', 'value', 'unit'))
+        required = {'op', 'value', 'unit'}
+        fields(goal, required | {'bp_context'} if metric in BP_LIMITS else required, required)
+        if 'bp_context' in goal:
+            require(goal['bp_context'] in ('clinic', 'home', 'ambulatory'), '医生血压目标须注明测量场景。')
         require(goal['op'] in ('<', '<=', '>', '>='), '医生目标必须确认方向。')
         unit_for(metric, goal['unit'])
         number(goal['value'])
@@ -78,9 +93,10 @@ def check_profile(profile):
 
 def check_measurement(item):
     core = {'metric', 'unit', 'value', 'date'}
-    fields(item, core | {'reference', 'series', 'lab_range_applicable', 'general_goal_applicable', 'bp_context'}, core)
+    fields(item, core | {'reference', 'series', 'lab_range_applicable', 'general_goal_applicable', 'bp_context',
+                        'older_bp_applicable', 'ldl_baseline', 'dxa_applicable'}, core)
     unit_for(item['metric'], item['unit'])
-    number(item['value'])
+    number(item['value'], minimum=-1_000_000_000 if item['metric'] == T_SCORE else 0)
     day = item['date']
     require(isinstance(day, str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', day) and date.fromisoformat(day) <= date.today(), '请提供有效、非未来的采样日期。')
     if 'series' in item:
@@ -97,6 +113,14 @@ def check_measurement(item):
         require(type(item['general_goal_applicable']) is bool, '一般成人目标适用性必须为布尔值。')
     if 'bp_context' in item:
         require(item['metric'] in BP_LIMITS and item['bp_context'] in ('clinic', 'home', 'ambulatory', 'unknown'), '请核对血压测量场景。')
+    if 'older_bp_applicable' in item:
+        require(item['metric'] in BP_LIMITS and type(item['older_bp_applicable']) is bool, '老年血压目标适用性必须为布尔值。')
+    if 'ldl_baseline' in item:
+        require(item['metric'] == LDL and item['unit'] == 'mmol/L', '仅支持以 mmol/L 核对本人的治疗前低密度脂蛋白基线。')
+        number(item['ldl_baseline'])
+        require(item['ldl_baseline'] > 0, '低密度脂蛋白基线须大于零。')
+    if 'dxa_applicable' in item:
+        require(item['metric'] == T_SCORE and type(item['dxa_applicable']) is bool, 'DXA T 值适用性必须为布尔值。')
 
 
 def profile_path(args):
@@ -181,25 +205,44 @@ def review(data, args):
         return f'{alert}\n\n{DISCLAIMER}'
     if data.get('critical_flag') is True:
         return f'请立即联系开单医院或急诊核对报告危急值，不要等待线上解读。\n\n{DISCLAIMER}'
-    fields(data, ('scope', 'symptoms', 'critical_flag', 'measurements', 'schedule', 'schedule_verified'), ('scope',))
-    require(data['scope'] in SCOPES, '适用人群字段不符。')
+    fields(data, ('scope', 'symptoms', 'critical_flag', 'measurements', 'schedule', 'schedule_verified', 'context'))
+    scope = data.get('scope')
+    require(scope is None or scope in SCOPES, '适用人群字段不符。')
     require(all(key not in data or type(data[key]) is bool for key in ('critical_flag', 'schedule_verified')), '危急值和医嘱确认字段须明确填写 true 或 false。')
-    if data['scope'] != 'adult':
+    if scope in ('minor', 'pregnant'):
         return f'暂不套用成人规则、不建档或记录。请联系相应科室；如尚未确认，请先说明是否成年且不在孕期。\n\n{DISCLAIMER}'
+    require(not args.person or 'context' not in data, '不能混用本次资料和已有档案；请先核对对象。')
+    context = data.get('context', {})
+    fields(context, PROFILE_FIELDS - {'alias'})
+    if not context.get('age_band') and (not args.person or scope in (None, 'unknown')):
+        return f'{AGE_QUESTION}\n\n{DISCLAIMER}'
+    if scope in (None, 'unknown'):
+        return f'请先确认这位家人是非孕成年人。\n\n{DISCLAIMER}'
+    if context.get('age_band') == '未知':
+        return f'{AGE_QUESTION}\n\n{DISCLAIMER}'
     require(args.person or not args.persist, '保存指标前须指定已同意建档的人。')
     path = profile_path(args) if args.person else None
-    record = load(path) if path else {'profile': {}, 'history': []}
+    record = load(path) if path else {'profile': {
+        'alias': '本次解读', 'age_band': '未知', 'sex': '未知', 'conditions': [], 'medications': [],
+        'allergies': [], 'targets': {}, **context,
+    }, 'history': []}
     profile, history = record['profile'], record['history']
+    check_profile(profile)
+    if profile['age_band'] == '未知':
+        return f'{AGE_QUESTION}\n\n{DISCLAIMER}'
+    older = profile['age_band'] in OLDER_AGES
     items = data.get('measurements', [])
     require(isinstance(items, list) and len(items) <= 50, '指标必须是列表，每次最多 50 条。')
     lines = []
     pending = []
     goals_to_ask = []
+    needs_ldl_question = False
     for item in items:
         check_measurement(item)
         comparison = assessment(item, profile)
         if comparison.endswith(PERSONAL_GOAL_QUESTION) and item['metric'] not in goals_to_ask:
             goals_to_ask.append(item['metric'])
+        needs_ldl_question |= comparison.endswith(LDL_QUESTION)
         lines.append(f'- {item["metric"]} {item["value"]} {item["unit"]}（{item["date"]}）：{comparison} {trend(item, history)}')
         row = {key: item[key] for key in ('date', 'metric', 'value', 'unit', 'series') if key in item}
         if row not in history and row not in pending:
@@ -207,20 +250,28 @@ def review(data, args):
     table = medication_table(data, profile)
     questions = [f'- {"、".join(goals_to_ask)}：{PERSONAL_GOAL_QUESTION}'] if goals_to_ask else [
         '- 这次结果在我的情况下应看哪个目标，什么时候复查？']
-    note = medication_note(profile)
-    if note:
-        questions.append(f'- {note}')
+    if needs_ldl_question:
+        questions.append(f'- {LDL_QUESTION}')
+    if older and (any(item['metric'] == EGFR for item in items) or confirmed_conditions(profile) & {'慢性肾病', '慢性肾脏疾病', '肾功能不全'}):
+        questions.append('- 肾功能下降时，有些药的剂量需要由医生核对；复诊把药盒和报告带上，不自己调药。')
+    if older and (any(item['metric'] == T_SCORE for item in items) or confirmed_conditions(profile) & {'骨质疏松', '跌倒史', '骨折史'}):
+        questions.append('- 如果曾摔倒或轻轻一摔就骨折，复诊时告诉医生；问问怎样防跌倒、哪些情况要及时就诊。')
+    questions.extend(f'- {note}' for note in medication_notes(profile))
     if profile.get('allergies'):
         questions.append('- 复诊时告诉医生已知的药物过敏史。')
     if args.persist and pending:
         save(path, {**record, 'history': history + pending})
     status = '指标已按授权记录到本地档案。' if args.persist and pending else '本次未新增档案记录。'
+    age_line = f'老年线（{profile["age_band"]} 岁；旧档 60–79 需细分才能用老年血压目标）' if profile['age_band'] == '60-79' else (
+        f'老年线（{profile["age_band"]} 岁）' if older else '一般成人线（18–59 岁）')
+    family = '爸、妈，咱们慢慢看，不用记这些数字。复诊我陪您把单子和药盒带上，一项一项问清楚。药照现在医生交代的用，咱们不自己改。' if older else (
+        '这张单子咱们先收好。下次去医院，咱们带上原单，问医生哪些要再查、你的目标是多少。药还是照医生现在交代的吃，咱们不自己改。')
     return '\n\n'.join((
-        '## ① 大白话解读\n\n' + ('\n'.join(lines) or '未提供确认过的指标。') + '\n\n区间或目标比较不能判断病因、严重程度，也不能排除急症。' + status,
+        f'## ① 大白话解读\n\n{age_line}\n\n' + ('\n'.join(lines) or '未提供确认过的指标。') + '\n\n区间或目标比较不能判断病因、严重程度，也不能排除急症。' + status,
         '## ② 大字版用药时间表\n\n' + table,
         '## ③ 下次复诊的问题\n\n' + '\n'.join(questions),
         '## ④ 哪些情况要立刻就医\n\n' + RED_FLAGS,
-        '## ⑤ 可以念给家人听\n\n这张单子咱们先收好。下次去医院，咱们带上原单，问医生哪些要再查、你的目标是多少。药还是照医生现在交代的吃，咱们不自己改。',
+        '## ⑤ 可以念给家人听\n\n' + family,
         DISCLAIMER,
     ))
 
@@ -240,6 +291,8 @@ def cli():
         if action == 'create':
             command.add_argument('--consent', action='store_true', help=CONSENT)
             command.add_argument('--scope', required=True, choices=SCOPES, help='先确认是非孕成年人才能建档')
+        if action in ('create', 'update'):
+            command.add_argument('--older-consent', action='store_true', help=OLDER_CONSENT)
         if action == 'delete':
             command.add_argument('--confirm', action='store_true', help='已确认删除的是这个人的档案')
         if action == 'review':
@@ -258,6 +311,7 @@ def cli():
             require(args.scope == 'adult' and args.consent, '仅非孕成年人；未经资料本人单独同意不建档。')
             profile = read_json(sys.stdin.buffer)
             check_profile(profile)
+            require(args.older_consent or not any(profile.get(key) for key in PROFILE_FIELDS - CORE_PROFILE), OLDER_CONSENT)
             save(profile_path(args), {'profile': profile, 'consent': 'separate-v1', 'history': []}, create=True)
             print('本地档案已建立。')
             return 0
@@ -275,6 +329,7 @@ def cli():
             return 0
         changes = read_json(sys.stdin.buffer)
         fields(changes, PROFILE_FIELDS)
+        require(args.older_consent or not any(changes.get(key) for key in PROFILE_FIELDS - CORE_PROFILE), OLDER_CONSENT)
         profile = {**record['profile'], **changes}
         if 'targets' in changes:
             require(isinstance(changes['targets'], dict) and set(changes['targets']) <= set(METRICS), '医生目标须指定对应指标。')
