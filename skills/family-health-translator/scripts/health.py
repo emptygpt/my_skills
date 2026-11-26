@@ -12,12 +12,15 @@ from datetime import date
 sys.dont_write_bytecode = True
 from rules import (
     BP_LIMITS, DISCLAIMER, EGFR, LDL, LDL_LIMITS, LDL_QUESTION, METRICS, OLDER_AGES, OLDER_ANSWERS,
-    PERSONAL_GOAL_QUESTION, RED_FLAGS, T_SCORE, assessment, confirmed_conditions, medication_notes, normalized, trend, triage,
+    NO_TREND, PERSONAL_GOAL_QUESTION, RED_FLAGS, T_SCORE, confirmed_conditions, grade, medication_notes, normalized, trend, triage,
 )
 
 
 AGE_BANDS = ('18-19', '20-59', '60-64', '65-79', '60-79', '80+', '未知')
-AGE_QUESTION = '这位家人多大年纪？是否怀孕（女性）？'
+AGE_QUESTION = '这位家人多大年纪？（60 岁上下看的线不一样）'
+PREGNANCY_QUESTION = '她现在是否怀孕？（只需 18–55 岁女性确认；性别没写时请一并说明，确认是非孕成年人后再看指标）'
+MARKS = ('🔴', '🟡', '✅', '⚪')
+NEXT_STEP = {'🔴': '复诊问医生', '🟡': '问目标或补信息', '⚪': '问开单医院'}
 CORE_PROFILE = {'alias', 'age_band', 'sex', 'conditions', 'medications', 'allergies', 'targets'}
 PROFILE_FIELDS = CORE_PROFILE | {'older_diabetes', 'ldl_risk'}
 NAME = re.compile(r'[\u3400-\u9fffA-Za-z0-9 ·＋+（）()\-]{1,40}')
@@ -94,7 +97,8 @@ def check_profile(profile):
 def check_measurement(item):
     core = {'metric', 'unit', 'value', 'date'}
     fields(item, core | {'reference', 'series', 'lab_range_applicable', 'general_goal_applicable', 'bp_context',
-                        'older_bp_applicable', 'ldl_baseline', 'dxa_applicable'}, core)
+                        'older_bp_applicable', 'ldl_baseline', 'dxa_applicable',
+                        'dxa_population_confirmed'}, core)
     unit_for(item['metric'], item['unit'])
     number(item['value'], minimum=-1_000_000_000 if item['metric'] == T_SCORE else 0)
     day = item['date']
@@ -119,8 +123,9 @@ def check_measurement(item):
         require(item['metric'] == LDL and item['unit'] == 'mmol/L', '仅支持以 mmol/L 核对本人的治疗前低密度脂蛋白基线。')
         number(item['ldl_baseline'])
         require(item['ldl_baseline'] > 0, '低密度脂蛋白基线须大于零。')
-    if 'dxa_applicable' in item:
-        require(item['metric'] == T_SCORE and type(item['dxa_applicable']) is bool, 'DXA T 值适用性必须为布尔值。')
+    for key in ('dxa_applicable', 'dxa_population_confirmed'):
+        if key in item:
+            require(item['metric'] == T_SCORE and type(item[key]) is bool, 'DXA T 值适用性必须为布尔值。')
 
 
 def profile_path(args):
@@ -214,10 +219,10 @@ def review(data, args):
     require(not args.person or 'context' not in data, '不能混用本次资料和已有档案；请先核对对象。')
     context = data.get('context', {})
     fields(context, PROFILE_FIELDS - {'alias'})
-    if not context.get('age_band') and (not args.person or scope in (None, 'unknown')):
+    if not context.get('age_band') and (not args.person or scope == 'unknown'):
         return f'{AGE_QUESTION}\n\n{DISCLAIMER}'
-    if scope in (None, 'unknown'):
-        return f'请先确认这位家人是非孕成年人。\n\n{DISCLAIMER}'
+    if scope == 'unknown' and context.get('age_band') != '未知':
+        return f'{PREGNANCY_QUESTION}\n\n{DISCLAIMER}'
     if context.get('age_band') == '未知':
         return f'{AGE_QUESTION}\n\n{DISCLAIMER}'
     require(args.person or not args.persist, '保存指标前须指定已同意建档的人。')
@@ -230,50 +235,108 @@ def review(data, args):
     check_profile(profile)
     if profile['age_band'] == '未知':
         return f'{AGE_QUESTION}\n\n{DISCLAIMER}'
+    if scope is None and profile['age_band'] not in OLDER_AGES and profile['sex'] != '男':
+        return f'{PREGNANCY_QUESTION}\n\n{DISCLAIMER}'
     older = profile['age_band'] in OLDER_AGES
     items = data.get('measurements', [])
     require(isinstance(items, list) and len(items) <= 50, '指标必须是列表，每次最多 50 条。')
-    lines = []
+    results = []
     pending = []
-    goals_to_ask = []
-    needs_ldl_question = False
     for item in items:
         check_measurement(item)
-        comparison = assessment(item, profile)
-        if comparison.endswith(PERSONAL_GOAL_QUESTION) and item['metric'] not in goals_to_ask:
-            goals_to_ask.append(item['metric'])
-        needs_ldl_question |= comparison.endswith(LDL_QUESTION)
-        lines.append(f'- {item["metric"]} {item["value"]} {item["unit"]}（{item["date"]}）：{comparison} {trend(item, history)}')
+        results.append((item, grade(item, profile), trend(item, history)))
         row = {key: item[key] for key in ('date', 'metric', 'value', 'unit', 'series') if key in item}
         if row not in history and row not in pending:
             pending.append(row)
-    table = medication_table(data, profile)
-    questions = [f'- {"、".join(goals_to_ask)}：{PERSONAL_GOAL_QUESTION}'] if goals_to_ask else [
-        '- 这次结果在我的情况下应看哪个目标，什么时候复查？']
-    if needs_ldl_question:
-        questions.append(f'- {LDL_QUESTION}')
+    table = medication_table(data, profile) if data.get('schedule') else None
+    reminders = []
     if older and (any(item['metric'] == EGFR for item in items) or confirmed_conditions(profile) & {'慢性肾病', '慢性肾脏疾病', '肾功能不全'}):
-        questions.append('- 肾功能下降时，有些药的剂量需要由医生核对；复诊把药盒和报告带上，不自己调药。')
+        reminders.append('- 肾功能下降时，有些药的剂量需要由医生核对；复诊把药盒和报告带上，不自己调药。')
     if older and (any(item['metric'] == T_SCORE for item in items) or confirmed_conditions(profile) & {'骨质疏松', '跌倒史', '骨折史'}):
-        questions.append('- 如果曾摔倒或轻轻一摔就骨折，复诊时告诉医生；问问怎样防跌倒、哪些情况要及时就诊。')
-    questions.extend(f'- {note}' for note in medication_notes(profile))
+        reminders.append('- 如果曾摔倒或轻轻一摔就骨折，复诊时告诉医生；问问怎样防跌倒、哪些情况要及时就诊。')
+    reminders.extend(f'- {note}' for note in medication_notes(profile))
     if profile.get('allergies'):
-        questions.append('- 复诊时告诉医生已知的药物过敏史。')
+        reminders.append('- 复诊时告诉医生已知的药物过敏史。')
     if args.persist and pending:
         save(path, {**record, 'history': history + pending})
-    status = '指标已按授权记录到本地档案。' if args.persist and pending else '本次未新增档案记录。'
-    age_line = f'老年线（{profile["age_band"]} 岁；旧档 60–79 需细分才能用老年血压目标）' if profile['age_band'] == '60-79' else (
-        f'老年线（{profile["age_band"]} 岁）' if older else '一般成人线（18–59 岁）')
-    family = '爸、妈，咱们慢慢看，不用记这些数字。复诊我陪您把单子和药盒带上，一项一项问清楚。药照现在医生交代的用，咱们不自己改。' if older else (
-        '这张单子咱们先收好。下次去医院，咱们带上原单，问医生哪些要再查、你的目标是多少。药还是照医生现在交代的吃，咱们不自己改。')
-    return '\n\n'.join((
-        f'## ① 大白话解读\n\n{age_line}\n\n' + ('\n'.join(lines) or '未提供确认过的指标。') + '\n\n区间或目标比较不能判断病因、严重程度，也不能排除急症。' + status,
-        '## ② 大字版用药时间表\n\n' + table,
-        '## ③ 下次复诊的问题\n\n' + '\n'.join(questions),
-        '## ④ 哪些情况要立刻就医\n\n' + RED_FLAGS,
-        '## ⑤ 可以念给家人听\n\n' + family,
-        DISCLAIMER,
-    ))
+    return report(profile, results, table, reminders, bool(args.persist and pending))
+
+
+def conclusion(results):
+    found = {mark: [item['metric'] for item, result, _ in results if result['mark'] == mark] for mark in MARKS}
+    if found['🔴']:
+        return f'这次有 {len(found["🔴"])} 项超出对照线：{"、".join(found["🔴"])}，要带给医生看；药照医生现在交代的用。'
+    if found['🟡']:
+        return f'{"、".join(found["🟡"])}要医生定目标或补信息才能判断；其余能对照的项没有超出线。'
+    if found['✅']:
+        extra = '另有项目本工具看不了；' if found['⚪'] else ''
+        return f'能对照的项都在范围内；{extra}这不代表没有病，也不能排除急症。'
+    if found['⚪']:
+        return '这次的指标缺少可对照的标准，本工具不判断高低。'
+    return '这次没有收到确认过的指标。'
+
+
+def cell(item, result):
+    value = f'{item["value"]} {item["unit"]}'
+    if result['mark'] != '🔴':
+        return f'| {result["mark"]} | {item["metric"]} | {value} | {result["verdict"]} | {NEXT_STEP[result["mark"]]} |'
+    arrow, gap = result['gap'] or ('', '')
+    detail = f'{gap}；{result["verdict"]}' if gap else result['verdict']
+    return f'| 🔴 | **{item["metric"]}** | **{f"{value} {arrow}".strip()}** | {detail} | {NEXT_STEP["🔴"]} |'
+
+
+def report(profile, results, table, reminders, saved):
+    age = profile['age_band']
+    older = age in OLDER_AGES
+    lane = {'80+': '按 80 岁及以上看', '60-79': '按 60–79 岁看（旧档需细分，才能用老年血压目标）'}.get(
+        age, f'按 {age.replace("-", "–")} 岁看' if older else '按一般成人（18–59 岁）看')
+    status = '指标已按授权记录到本地档案' if saved else '本次未新增档案记录'
+    days = '、'.join(sorted({item['date'] for item, _, _ in results}))
+    blocks = [f'**{conclusion(results)}**\n{" · ".join(part for part in (status, lane, days) if part)}']
+    rows = [cell(item, result) for mark in MARKS if mark != '✅' for item, result, _ in results if result['mark'] == mark]
+    green = '；'.join(f'{item["metric"]} {item["value"]} {item["unit"]}（{result["verdict"]}）'
+                     for item, result, _ in results if result['mark'] == '✅')
+    if green:
+        position = sum(result['mark'] in ('🔴', '🟡') for _, result, _ in results)
+        rows.insert(position, f'| ✅ | 在对照范围内 | {green} | | |')
+    if rows:
+        blocks.append('| | 项目 | 这次 | 对照 | 怎么办 |\n|---|---|---|---|---|\n' + '\n'.join(rows))
+        changed = [f'{item["metric"]}{change}' for item, _, change in results if change != NO_TREND]
+        if not changed:
+            history_line = NO_TREND
+        else:
+            history_line = '和以前比：' + ' '.join(changed) + ('其余项没有可比记录。' if len(changed) < len(results) else '')
+        blocks.append(f'{history_line}\n标记只表示和对照线的关系，不代表病情轻重，也不能排除急症。')
+    if table:
+        blocks.append('大字版用药时间表\n\n' + table)
+    questions = []
+    reds = [item['metric'] for item, result, _ in results if result['mark'] == '🔴']
+    if reds:
+        questions.append(f'{"、".join(reds)}超出了对照线，要怎么处理、多久复查？')
+    goals = list(dict.fromkeys(item['metric'] for item, result, _ in results if result['question'] == PERSONAL_GOAL_QUESTION))
+    if goals:
+        questions.append(f'{"、".join(goals)}：{PERSONAL_GOAL_QUESTION}')
+    if any(result['question'] == LDL_QUESTION for _, result, _ in results):
+        questions.append(LDL_QUESTION)
+    if not questions:
+        questions.append('这次结果在我的情况下应看哪个目标，什么时候复查？')
+    questions[0] = f'**{questions[0]}**'
+    numbered = '\n'.join(f'{index}. {text}' for index, text in enumerate(questions[:3], 1))
+    blocks.append(f'复诊先问\n{numbered}\n带上：原化验单、正在用的药盒。')
+    if reminders:
+        blocks.append('还要告诉医生：\n' + '\n'.join(reminders))
+    blocks.append(RED_FLAGS)
+    if older:
+        who, call = {'男': ('爸', '爸'), '女': ('妈', '妈')}.get(profile['sex'], ('家人', '爸、妈'))
+        words = f'{call}，咱们慢慢看，不用记这些数字。复诊我陪您把单子和药盒带上，一项一项问清楚。药照现在医生交代的用，咱们不自己改。'
+    else:
+        who, words = '家人', '这张单子咱们先收好。下次去医院，咱们带上原单，问医生哪些要再查、你的目标是多少。药还是照医生现在交代的吃，咱们不自己改。'
+    blocks.append(f'念给{who}听：「{words}」')
+    sources = list(dict.fromkeys(result['source'] for _, result, _ in results if result['source']))
+    if sources:
+        blocks.append('出处：\n' + '\n'.join(f'- {source}' for source in sources))
+    blocks.append(DISCLAIMER)
+    return '\n\n'.join(blocks)
 
 
 def cli():

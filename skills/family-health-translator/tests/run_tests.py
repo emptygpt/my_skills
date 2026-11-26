@@ -10,7 +10,7 @@ sys.dont_write_bytecode = True
 ROOT = Path(__file__).resolve().parents[1]
 ENTRY = ROOT / 'scripts' / 'health.py'
 sys.path.insert(0, str(ENTRY.parent))
-from rules import ACUTE, FEVER, GOUT, RENAL, assessment, trend, triage
+from rules import ACUTE, FEVER, GOUT, RENAL, assessment, grade, trend, triage
 
 
 BASE = {'alias': '示例甲', 'age_band': '60-79', 'sex': '男', 'conditions': [],
@@ -111,7 +111,7 @@ class LocalFixture(unittest.TestCase):
 
 class LocalFlowTests(LocalFixture):
     def test_age_required_before_any_interpretation_or_write(self):
-        question = '这位家人多大年纪？是否怀孕（女性）？'
+        question = '这位家人多大年纪？（60 岁上下看的线不一样）'
         data = {'scope': 'adult', 'measurements': [URATE]}
         for payload in (data, {'measurements': [URATE]}, {**data, 'scope': 'unknown'}):
             with self.subTest(payload=payload):
@@ -159,7 +159,7 @@ class LocalFlowTests(LocalFixture):
                         self.assertIn('这位家人多大年纪', result)
                         self.assertNotIn('##', result)
                         continue
-                    questions = result.split('## ③')[1].split('## ④')[0]
+                    questions = result.split('复诊先问')[1].split('🚨')[0]
                     self.assertIn(ASK_GOAL, questions)
                     self.assertNotIn('在参考区间内', result)
 
@@ -260,7 +260,8 @@ class LocalFlowTests(LocalFixture):
         self.assertIn('08:00 ｜ 虚构片甲 ｜ 1 片', result)
         self.assertIn('复诊时告诉医生有痛风', result)
         self.assertNotIn('建议停药', result)
-        self.assertEqual(result.count('## '), 6)
+        self.assertEqual(result.count('大字版用药时间表'), 1)
+        self.assertEqual(result.count('### '), 1)
 
     def test_conflicting_regimen_and_known_allergy_not_printed(self):
         self.create({**BASE, 'allergies': ['虚构片甲']})
@@ -290,9 +291,9 @@ class OlderReviewTests(LocalFixture):
         systolic = {**PRESSURE, 'value': 145, 'older_bp_applicable': True}
         diastolic = {**systolic, 'metric': '舒张压', 'value': 84}
         for bracket, lane, outcome, followup in (
-            ('20-59', '一般成人线', '未达到此目标。采用 ＜140', '一般患者诊室目标'),
-            ('65-79', '老年线', '未达到此目标。采用 ＜140', '如能耐受可进一步到 ＜130/80'),
-            ('80+', '老年线', '符合此目标。采用 ＜150', '如能耐受可进一步到 ＜140/90'),
+            ('20-59', '按一般成人', '未达到此目标。采用 ＜140', '一般患者诊室目标'),
+            ('65-79', '按 65–79 岁看', '未达到此目标。采用 ＜140', '如能耐受可进一步到 ＜130/80'),
+            ('80+', '按 80 岁及以上看', '符合此目标。采用 ＜150', '如能耐受可进一步到 ＜140/90'),
         ):
             with self.subTest(age_band=bracket):
                 result = self.read_older(systolic, diastolic, age_band=bracket, conditions=['高血压'])
@@ -371,6 +372,167 @@ class OlderReviewTests(LocalFixture):
         self.assertEqual(json.loads(self.run_cli('show', '--person', 'demo'))['profile']['ldl_risk'], 'very_high')
         self.run_cli('update', '--person', 'demo', data={'ldl_risk': None})
         self.assertIsNone(json.loads(self.run_cli('show', '--person', 'demo'))['profile']['ldl_risk'])
+
+
+class ColloquialEmergencyTests(unittest.TestCase):
+    def test_phrases_missed_by_third_version(self):
+        for symptom in (
+            '我妈今天突然一边手没力气 拿杯子都掉了 是不是血压高了啊', '我妈突然一只手抬不起来', '突然半边身子没劲',
+            '我爸说话突然大舌头了', '我爸突然说话不清楚', '嘴突然歪了', '心口疼得厉害', '拉的大便是黑色的',
+        ):
+            with self.subTest(symptom=symptom):
+                self.assertEqual(triage(symptom), ACUTE)
+
+    def test_similar_colloquial_phrases(self):
+        for symptom in (
+            '一边没劲', '一只胳膊突然使不上劲', '左边身子发麻', '右腿突然不听使唤', '一条腿突然动不了', '半边脸突然歪了',
+            '突然手抬不起来', '突然拿不住筷子', '说话含糊不清', '话都说不利索了', '舌头突然发硬', '吐字不清', '嘴巴有点歪',
+            '嘴角歪了', '心口窝一直疼', '心脏突然很疼', '胸口闷得很喘不过气', '上不来气', '大便发黑', '拉黑屎了',
+            '黑色大便', '这两天大便都是黑的', '吐了好多血', '喊不醒', '不省人事', '突然糊涂了', '突然头特别疼',
+            '没想到突然一边手没劲', '我妈没有胸痛，可是说话大舌头',
+        ):
+            with self.subTest(symptom=symptom):
+                self.assertEqual(triage(symptom), ACUTE)
+
+    def test_denied_or_unrelated_words_stay_quiet(self):
+        for symptom in (
+            '说话很清楚', '嘴没歪', '大便不黑', '胸口不疼', '心口不疼', '没有大舌头', '没有一边手没力气',
+            '没有出现半边身子没劲', '最近浑身没劲', '血压150/90左右', '平时150左右手脚都挺好', '一边吃饭一边看电视',
+            '想吐血压还高', '大便正常', '左手没问题', '我说不清他哪天量的',
+        ):
+            with self.subTest(symptom=symptom):
+                self.assertIsNone(triage(symptom))
+
+
+class CandidateLineTests(unittest.TestCase):
+    OLDER = {**BASE, 'age_band': '65-79', 'conditions': ['高血压', '2型糖尿病']}
+
+    def test_blood_pressure_both_lines_agree(self):
+        for metric, over, within, between in (('收缩压', 150, 128, 138), ('舒张压', 92, 78, 84)):
+            item = {**PRESSURE, 'metric': metric}
+            with self.subTest(metric=metric):
+                self.assertIn('不管按哪条线都超过', assessment({**item, 'value': over}, self.OLDER))
+                self.assertEqual(grade({**item, 'value': over}, self.OLDER)['mark'], '🔴')
+                self.assertIn('不管按哪条线都在内', assessment({**item, 'value': within}, self.OLDER))
+                self.assertEqual(grade({**item, 'value': within}, self.OLDER)['mark'], '✅')
+                self.assertIn('不能自动择一', assessment({**item, 'value': between}, self.OLDER))
+                self.assertEqual(grade({**item, 'value': between}, self.OLDER)['mark'], '🟡')
+        for change in ({'bp_context': 'home'}, {'older_bp_applicable': False}):
+            result = assessment({**PRESSURE, 'value': 170, **change}, self.OLDER)
+            self.assertNotIn('不管按哪条', result)
+
+    def test_complex_gout_both_lines_agree(self):
+        profile = {**GENERAL, 'conditions': ['痛风', '痛风发病年龄小于40岁']}
+        self.assertIn('不管按哪条线都超过', assessment({**URATE, 'value': 410}, profile))
+        self.assertIn('不管按哪条线都在内', assessment({**URATE, 'value': 280}, profile))
+        self.assertIn('两条线结论不同', assessment({**URATE, 'value': 330}, profile))
+        self.assertNotIn('不管按哪条', assessment({**URATE, 'value': 150}, profile))
+
+    def test_older_a1c_without_band(self):
+        profile = {**BASE, 'age_band': '65-79', 'conditions': ['2型糖尿病']}
+        for value, text, mark in ((9.0, '不管按哪一档都超过', '🔴'), (6.8, '哪一档的上限都没超过', '✅'), (7.8, '看医生定哪一档', '🟡')):
+            with self.subTest(value=value):
+                item = {**HBA1C, 'value': value}
+                self.assertIn(text, assessment(item, profile))
+                self.assertIn(ASK_GOAL, assessment(item, profile))
+                self.assertEqual(grade(item, profile)['mark'], mark)
+
+    def test_t_score_population_follows_2022_guideline(self):
+        item = {'metric': '骨密度T值', 'unit': 'SD', 'value': -2.7, 'dxa_applicable': True, 'date': '2026-10-01'}
+        woman = {**BASE, 'age_band': '20-59', 'sex': '女'}
+        self.assertIn('暂不判断', assessment(item, woman))
+        self.assertEqual(grade(item, woman)['mark'], '🟡')
+        confirmed = {**item, 'dxa_population_confirmed': True}
+        self.assertIn('低骨密度阈值', assessment(confirmed, woman))
+        self.assertEqual(grade(confirmed, woman)['mark'], '🔴')
+        self.assertIn('暂不判断', assessment(confirmed, {**woman, 'age_band': '18-19'}))
+
+
+class ReportLayoutTests(LocalFixture):
+    def full(self, *items, **context):
+        return self.run_cli('review', data={'scope': 'adult', 'context': {'age_band': '65-79', **context}, 'measurements': items})
+
+    def sample(self, sex='男'):
+        report = {'metric': '总胆固醇', 'unit': 'mmol/L', 'value': 5.2, 'date': '2026-10-01'}
+        egfr = {'metric': '估算肾小球滤过率', 'unit': 'mL/min/1.73m²', 'value': 95, 'date': '2026-10-01'}
+        albumin = {'metric': '血清肌酐', 'unit': 'μmol/L', 'value': 80, 'date': '2026-10-01', 'reference': {'min': 57, 'max': 111}}
+        pressure = {**PRESSURE, 'value': 150}
+        a1c = {**HBA1C, 'value': 7.8}
+        return self.full(report, egfr, a1c, albumin, pressure, sex=sex, conditions=['高血压', '2型糖尿病'])
+
+    def test_conclusion_first_marks_sorted_and_green_merged(self):
+        result = self.sample()
+        first = result.splitlines()[0]
+        self.assertTrue(first.startswith('**') and first.endswith('**'))
+        self.assertIn('收缩压', first)
+        rows = [line for line in result.splitlines() if line.startswith(('| 🔴', '| 🟡', '| ✅', '| ⚪'))]
+        self.assertEqual([row.split('|')[1].strip() for row in rows], ['🔴', '🟡', '✅', '⚪'])
+        self.assertIn('估算肾小球滤过率', rows[2])
+        self.assertIn('血清肌酐', rows[2])
+        self.assertIn('**150 mmHg ↑**', rows[0])
+
+    def test_no_prescription_no_table_questions_capped_sources_last(self):
+        result = self.sample()
+        self.assertNotIn('用药时间表', result)
+        questions = result.split('复诊先问')[1].split('🚨')[0]
+        numbered = [line for line in questions.splitlines() if line[:3] in ('1. ', '2. ', '3. ', '4. ')]
+        self.assertTrue(1 <= len(numbered) <= 3)
+        self.assertTrue(numbered[0].startswith('1. **'))
+        self.assertFalse(any('**' in line for line in numbered[1:]))
+        self.assertEqual(result.count('不判断趋势'), 1)
+        self.assertEqual(result.count('🚨 **马上打 120**'), 1)
+        self.assertEqual(result.count('🏥 **尽快就医**'), 1)
+        self.assertIn('说话不清、嘴歪', result)
+        body, sources = result.split('出处：', 1)
+        self.assertNotIn('《', body)
+        self.assertIn('《', sources)
+        self.assertTrue(result.rstrip().endswith('以医生意见为准'))
+
+    def test_read_aloud_uses_sex(self):
+        self.assertIn('念给爸听：「爸，', self.sample('男'))
+        self.assertIn('念给妈听：「妈，', self.sample('女'))
+        self.assertIn('爸、妈', self.sample('未知'))
+
+    def test_colloquial_emergency_through_review(self):
+        result = self.run_cli('review', data={'symptoms': '我妈今天突然一边手没力气 拿杯子都掉了 是不是血压高了啊', 'measurements': [PRESSURE]})
+        self.assertEqual(result.splitlines()[0], ACUTE)
+        self.assertNotIn('|', result)
+
+    def test_pregnancy_only_asked_when_relevant(self):
+        for context in ({'age_band': '65-79'}, {'age_band': '20-59', 'sex': '男'}):
+            with self.subTest(context=context):
+                self.assertNotIn('是否怀孕', self.run_cli('review', data={'context': context, 'measurements': [URATE]}))
+        result = self.run_cli('review', data={'context': {'age_band': '20-59', 'sex': '女'}, 'measurements': [URATE]})
+        self.assertIn('是否怀孕', result)
+        self.assertNotIn('400', result)
+
+
+class SkillTextTests(unittest.TestCase):
+    TEXT = (ROOT / 'SKILL.md').read_text(encoding='utf-8')
+
+    def test_length_links_and_signature_trial(self):
+        self.assertLessEqual(len(self.TEXT.splitlines()), 80)
+        for name in ('解读与档案', '本地输入', '标准来源'):
+            self.assertIn(f'(references/{name}.md)', self.TEXT)
+        opening = self.TEXT.split('## 第一次见面')[1]
+        quoted = next(line for line in opening.splitlines() if line.startswith('>'))
+        self.assertIn('虚构试用：70 岁和 85 岁', quoted)
+        self.assertIn('同样是 145/84：70 岁没达到，85 岁达到了。', self.TEXT)
+
+    def test_single_question_gets_short_answer(self):
+        rule = next(line for line in self.TEXT.splitlines() if line.startswith('**单个问题**'))
+        for phrase in ('结论一句', '原因 1–3 行', '下一步 1 行', '必要时一行急症', '「一句话」就只给一句', '不出表、药表、念读稿'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, rule)
+        self.assertIn('**整张报告或多项指标**用完整版', self.TEXT)
+        self.assertIn('没有内容的块整块删掉', self.TEXT)
+
+    def test_required_rules_present(self):
+        for phrase in ('按意思判断', '口语', '脚本没报警不代表没有急症', '说话不清', '嘴歪', '只解读这次、不存档，不想继续就说一声',
+                       '60 岁上下看的线不一样', '18–55 岁', '最多追问 1 个', '🔴', '🟡', '✅', '⚪', '不管按哪条都超过', '以医生意见为准'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.TEXT)
+        self.assertNotIn('优先用 `scripts/health.py`', self.TEXT)
 
 
 if __name__ == '__main__':
