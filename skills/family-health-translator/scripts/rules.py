@@ -14,6 +14,9 @@ KDIGO = 'KDIGO慢性肾病指南（2024）表1、表2及§4.2'
 BONE = '《原发性骨质疏松症诊疗指南（2022）》骨密度测定与诊断标准'
 HEMOGLOBIN = 'WS/T 405—2012 表1、第5章及附录A'
 PIM = '《中国老年人潜在不适当用药判断标准（2017年版）》表2'
+GLUCOSE_ADULT = '《中国糖尿病防治指南（2024版）》第六章一、表6（第29页；一般成人2型糖尿病毛细血管血糖目标）'
+GLUCOSE_OLDER = '《中国老年2型糖尿病防治临床指南（2026年版）》表4（第213页）'
+GLUCOSE_LOW = '《中国糖尿病防治指南（2024版）》第十七章低血糖（第77–78页）'
 PERSONAL_GOAL_QUESTION = '这项要按医生给你家人定的目标看，复诊时问一句：我的目标是多少？'
 LDL_QUESTION = '复诊时问一句：我的低密度脂蛋白目标是多少？'
 ADULT_AGES = {'18-19', '20-59'}
@@ -38,12 +41,27 @@ ACR = '《2020 ACR 痛风管理指南》表8（DOI: 10.1002/acr.24180）'
 METRICS = {
     '血尿酸': ('μmol/L', 'mg/dL'), '血清肌酐': ('μmol/L', 'mg/dL'),
     '血清尿素': ('mmol/L', 'mg/dL'), '空腹血糖': ('mmol/L', 'mg/dL'),
+    '非空腹血糖': ('mmol/L', 'mg/dL'), '餐后2小时血糖': ('mmol/L', 'mg/dL'),
     '血糖': ('mmol/L', 'mg/dL'), '糖化血红蛋白': ('%',),
     '收缩压': ('mmHg',), '舒张压': ('mmHg',),
     '总胆固醇': ('mmol/L', 'mg/dL'), '甘油三酯': ('mmol/L', 'mg/dL'),
     '低密度脂蛋白胆固醇': ('mmol/L', 'mg/dL'), '高密度脂蛋白胆固醇': ('mmol/L', 'mg/dL'),
     '丙氨酸氨基转移酶': ('U/L',), '天门冬氨酸氨基转移酶': ('U/L',),
     EGFR: (EGFR_UNIT,), T_SCORE: ('SD',), '血红蛋白': ('g/L',),
+}
+GLUCOSE = {'空腹血糖', '非空腹血糖', '餐后2小时血糖', '血糖'}
+# 控制目标只覆盖 2 型；没写型别的「糖尿病」按「如果是 2 型」比对。
+GLUCOSE_TYPES = {'糖尿病', '2型糖尿病'}
+GLUCOSE_LOW_LINE = 3.9
+# (档名, 下限, 上限, 是否含上限)
+ADULT_GLUCOSE = {
+    '空腹血糖': (('一般成人', 4.4, 7.0, True),),
+    '非空腹血糖': (('一般成人', None, 10.0, False),),
+    '餐后2小时血糖': (('一般成人', None, 10.0, False),),
+}
+OLDER_GLUCOSE = {
+    '空腹血糖': (('良好', 4.4, 7.0, True), ('过渡', 5.0, 7.5, False), ('可接受', 5.6, 8.5, False)),
+    '餐后2小时血糖': (('良好', None, 10.0, False), ('过渡', None, 11.1, False), ('可接受', None, 13.9, False)),
 }
 RENAL_RANGES = {
     ('男', '20-59'): ((57, 97), (3.1, 8.0)), ('男', '60-79'): ((57, 111), (3.6, 9.5)),
@@ -82,6 +100,8 @@ URGENT_FEVER = re.compile(r'高[热烧].{0,6}(?:不退|持续|反复)|持续.{0,
 FALL_PAUSE = re.compile(r'((?:突发|突然|忽然).{0,8}(?:头晕|眩晕))[，,](?=.{0,6}(?:跌倒|摔倒|摔了一跤|摔了|站不稳))')
 NEGATED = re.compile(r'(?:没有|并无|从无|否认|未见|未出现|无|没|不伴|不是)(?:出现|发生|过|什么|任何)*[：: ]*$')
 NOT_NEGATED = re.compile(r'(?:不是没有|不能排除|不确定有没有|不只是|不止|不只)[：: ]*$')
+LOW_GLUCOSE_ACTION = ('低血糖：低于 3.9 mmol/L。人清醒就马上吃 15–20 g 葡萄糖或含糖食物，15 分钟后复测，并马上联系医生；'
+                      '叫不醒或突然糊涂马上打 120')
 ACUTE = '请立即联系当地急救（中国大陆拨打 120）或前往急诊，不要等线上解读。'
 FEVER = '请尽快就医；高热伴呼吸困难、意识改变或迅速恶化时，立即联系当地急救。'
 RED_FLAGS = ('🚨 **马上打 120**：胸痛／一边手脚没力／说话不清、嘴歪／剧烈头痛／突然站不稳／叫不醒／喘不上气／吐血、黑便\n'
@@ -160,6 +180,8 @@ def rule_for(item, profile):
         stricter = conditions.intersection({'痛风石', '痛风每年至少发作2次', '慢性痛风性关节炎'})
         return {'op': '<', 'value': 300 if stricter else 360, 'unit': unit}, GOUT
     general = age in ('18-19', '20-59') and item.get('general_goal_applicable') is True
+    if name in GLUCOSE and conditions & DIABETES_TYPES:
+        return glucose_rule(item, profile, general)
     if name in BP_LIMITS and conditions.intersection({'高血压'} | BP_COMORBIDITIES):
         if general and conditions == {'高血压'} and unit == 'mmHg' and item.get('bp_context') == 'clinic':
             return {'op': '<', 'value': BP_LIMITS[name], 'unit': unit}, HYPERTENSION
@@ -214,17 +236,95 @@ def rule_for(item, profile):
     if name == '血红蛋白' and unit == 'g/L' and item.get('lab_range_applicable') is True and group[0] in HEMOGLOBIN_RANGES and group[1] in ('20-59', '60-79'):
         lower, upper = HEMOGLOBIN_RANGES[group[0]]
         return {'min': lower, 'max': upper}, f'{HEMOGLOBIN}（{group[0]}；实验室已确认适用；不是贫血诊断线）'
+    if name in GLUCOSE:
+        return None, '没有确诊糖尿病的记录，不套控制目标，也不凭这个数判断是不是糖尿病；没有适用的单子参考范围可对照。带上单子或测量记录问开单医生要不要复查'
     return None, '没有可核实且适用的标准；请向开单机构核对，不判断高低。'
 
 
-def graded(mark, verdict, source=None, question='', gap=None):
-    return {'mark': mark, 'verdict': verdict, 'source': source, 'question': question, 'gap': gap}
+def glucose_rule(item, profile, general):
+    """已确诊糖尿病者的血糖控制目标；不套用时返回问医生，不降级到单子参考范围。"""
+    name, age = item['metric'], profile.get('age_band')
+    conditions = confirmed_conditions(profile)
+    types = conditions & DIABETES_TYPES
+    source = GLUCOSE_OLDER if age in OLDER_AGES else GLUCOSE_ADULT
+
+    def ask(reason):
+        return None, f'{source}：{reason}。{PERSONAL_GOAL_QUESTION}'
+
+    if not types <= GLUCOSE_TYPES:
+        return ask('这里的目标只覆盖 2 型糖尿病')
+    if item['unit'] != 'mmol/L':
+        return ask('单位不是 mmol/L，请核对原单位，不换算')
+    if name == '血糖':
+        return ask('先说清是空腹还是饭后多久测的，两种目标不同')
+    if age in OLDER_AGES:
+        if name not in OLDER_GLUCOSE:
+            return ask('老年标准只列了空腹和饭后 2 小时，先说清是不是饭后 2 小时测的')
+        band = older_diabetes_band(profile)
+        tiers = tuple(tier for tier in OLDER_GLUCOSE[name] if not band or tier[0] == band[0])
+        return {'glucose': tiers}, source
+    if general and conditions == types:
+        return {'glucose': ADULT_GLUCOSE[name]}, source
+    return ask('一般成人目标要先确认适用；低血糖风险高、有严重并发症或合并症等情况医生可能放宽')
+
+
+def grade_glucose(item, tiers, source, profile):
+    value = item['value']
+    older = source == GLUCOSE_OLDER
+    states, shown = [], []
+    for label, lower, upper, inclusive in tiers:
+        over = value > upper or not inclusive and value == upper
+        states.append('over' if over else 'below' if lower is not None and value < lower else 'in')
+        top = f'{upper}' if inclusive else f'＜{upper}'
+        shown.append(f'{label} {lower}–{top}' if lower is not None else f'{label} {"≤" if inclusive else ""}{top}')
+    lines = f'{"、".join(shown)} mmol/L'
+    premise = '' if '2型糖尿病' in confirmed_conditions(profile) else '没说是几型，如果是 2 型：'
+    gap = None
+    if all(state == 'over' for state in states):
+        top = max(tier[2] for tier in tiers)
+        gap = ('↑', f'线是 {top}' if value == top else f'高出 {Decimal(str(value)) - Decimal(str(top)):f}')
+    if len(tiers) == 1:
+        mark, word = {'over': ('🔴', '超过'), 'in': ('✅', '在'), 'below': ('🟡', '低于')}[states[0]]
+        word = {'超过': '超过目标', '在': '在目标内', '低于': '低于目标下限；告诉医生，不自己调药'}[word]
+        if older:
+            verdict = f'按已确认资料对照「{tiers[0][0]}」档：{word}（{lines}）'
+        else:
+            verdict = f'{word}（{lines}，指尖血糖目标；低血糖风险高、有严重并发症或合并症时医生可能放宽）'
+        return graded(mark, premise + verdict, source, '' if mark == '✅' else PERSONAL_GOAL_QUESTION, gap)
+    if len(set(states)) == 1:
+        mark, verdict = {
+            'over': ('🔴', '不管按哪一档都超过'),
+            'in': ('✅', '不管按哪一档都在内'),
+            'below': ('🟡', '低于各档下限；告诉医生，不自己调药'),
+        }[states[0]]
+        verdict = f'{verdict}（{lines}）；该用哪一档请医生定'
+    else:
+        mark = '🟡'
+        parts = []
+        for state, word in (('over', '超过'), ('in', '在内'), ('below', '低于下限')):
+            labels = [f'{tier[0]}档' for tier, found in zip(tiers, states) if found == state]
+            if labels:
+                parts.append(f'按{"、".join(labels)}{word}' if state == 'over' else f'{"、".join(labels)}{word}')
+        verdict = f'{"，".join(parts)}（{lines}）；算不算达标看医生定哪一档'
+    return graded(mark, premise + verdict, source, PERSONAL_GOAL_QUESTION, gap)
+
+
+def graded(mark, verdict, source=None, question='', gap=None, urgent=False):
+    return {'mark': mark, 'verdict': verdict, 'source': source, 'question': question, 'gap': gap, 'urgent': urgent}
+
+
+def low_glucose(item, profile):
+    return (item['metric'] in GLUCOSE and item['unit'] == 'mmol/L' and item['value'] < GLUCOSE_LOW_LINE
+            and bool(confirmed_conditions(profile) & DIABETES_TYPES))
 
 
 def grade(item, profile):
     """标记只表示和对照线的关系：🔴 超过线；🟡 要医生定目标或补信息；✅ 在范围内；⚪ 本工具看不了。"""
     name = item['metric']
     value, unit = item['value'], item['unit']
+    # 低血糖排在任何控制目标（含医生个人目标）之前。
+    if low_glucose(item, profile):
+        return graded('🔴', LOW_GLUCOSE_ACTION, GLUCOSE_LOW, gap=('↓', '低血糖线是 3.9'), urgent=True)
     if name == EGFR:
         category = next(label for bound, label in (
             (90, 'G1：正常或较高'), (60, 'G2：轻度下降'), (45, 'G3a：轻到中度下降'),
@@ -262,6 +362,8 @@ def grade(item, profile):
             gap = ('↑', f'超过 {rule["limit"]}' if 'limit' in rule else '超过 360')
         return graded('🔴' if kind == 'over' else '✅', f'不管按哪条线都{word}（{rule["lines"]}）；该用哪条请医生定', source,
                       PERSONAL_GOAL_QUESTION, gap)
+    if 'glucose' in rule:
+        return grade_glucose(item, rule['glucose'], source, profile)
     if 'band' in rule:
         label, lower, upper = rule['band']
         bounds = f'≤{upper}%' if lower is None else f'＞{lower}% 至 ≤{upper}%'

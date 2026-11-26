@@ -11,8 +11,9 @@ from datetime import date
 
 sys.dont_write_bytecode = True
 from rules import (
-    BP_LIMITS, DISCLAIMER, EGFR, LDL, LDL_LIMITS, LDL_QUESTION, METRICS, OLDER_AGES, OLDER_ANSWERS,
-    NO_TREND, PERSONAL_GOAL_QUESTION, RED_FLAGS, T_SCORE, confirmed_conditions, grade, medication_notes, normalized, trend, triage,
+    BP_LIMITS, DISCLAIMER, EGFR, LDL, LDL_LIMITS, LDL_QUESTION, LOW_GLUCOSE_ACTION, METRICS, OLDER_AGES, OLDER_ANSWERS,
+    NO_TREND, PERSONAL_GOAL_QUESTION, RED_FLAGS, T_SCORE, confirmed_conditions, grade, low_glucose, medication_notes, normalized,
+    trend, triage,
 )
 
 
@@ -201,6 +202,17 @@ def medication_table(data, profile):
     return '\n'.join(lines) + '\n\n建议打印时将字号设为 20 磅以上。以现行医嘱为准，不自行改动。'
 
 
+def ask_age(items, profile):
+    """没年龄先问年龄；已确诊者的低血糖提醒不等年龄。"""
+    conditions = profile.get('conditions', [])
+    if isinstance(items, list) and isinstance(conditions, list) and all(isinstance(entry, str) for entry in conditions):
+        for item in items if conditions else []:
+            check_measurement(item)
+            if low_glucose(item, profile):
+                return f'{LOW_GLUCOSE_ACTION}。\n\n{AGE_QUESTION}\n\n{DISCLAIMER}'
+    return f'{AGE_QUESTION}\n\n{DISCLAIMER}'
+
+
 def review(data, args):
     require(isinstance(data, dict), '须提供一份 JSON 对象。')
     symptoms = data.get('symptoms', '')
@@ -220,11 +232,11 @@ def review(data, args):
     context = data.get('context', {})
     fields(context, PROFILE_FIELDS - {'alias'})
     if not context.get('age_band') and (not args.person or scope == 'unknown'):
-        return f'{AGE_QUESTION}\n\n{DISCLAIMER}'
+        return ask_age(data.get('measurements'), context)
     if scope == 'unknown' and context.get('age_band') != '未知':
         return f'{PREGNANCY_QUESTION}\n\n{DISCLAIMER}'
     if context.get('age_band') == '未知':
-        return f'{AGE_QUESTION}\n\n{DISCLAIMER}'
+        return ask_age(data.get('measurements'), context)
     require(args.person or not args.persist, '保存指标前须指定已同意建档的人。')
     path = profile_path(args) if args.person else None
     record = load(path) if path else {'profile': {
@@ -234,7 +246,7 @@ def review(data, args):
     profile, history = record['profile'], record['history']
     check_profile(profile)
     if profile['age_band'] == '未知':
-        return f'{AGE_QUESTION}\n\n{DISCLAIMER}'
+        return ask_age(data.get('measurements'), profile)
     if scope is None and profile['age_band'] not in OLDER_AGES and profile['sex'] != '男':
         return f'{PREGNANCY_QUESTION}\n\n{DISCLAIMER}'
     older = profile['age_band'] in OLDER_AGES
@@ -263,6 +275,9 @@ def review(data, args):
 
 
 def conclusion(results):
+    for item, result, _ in results:
+        if result['urgent']:
+            return f'{item["metric"]} {item["value"]} {item["unit"]}，{result["verdict"]}。'
     found = {mark: [item['metric'] for item, result, _ in results if result['mark'] == mark] for mark in MARKS}
     if found['🔴']:
         return f'这次有 {len(found["🔴"])} 项超出对照线：{"、".join(found["🔴"])}，要带给医生看；药照医生现在交代的用。'

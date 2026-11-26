@@ -90,6 +90,86 @@ class RulesTests(unittest.TestCase):
         self.assertIsNone(triage('没有胸痛；否认呕血。'))
 
 
+class GlucoseTests(unittest.TestCase):
+    FASTING = {'metric': '空腹血糖', 'unit': 'mmol/L', 'date': '2026-10-01', 'value': 7.8}
+    OLDER = {**BASE, 'age_band': '65-79', 'conditions': ['糖尿病']}
+    ADULT = {**GENERAL, 'conditions': ['2型糖尿病']}
+    HEALTHY = {'self_care': 'independent', 'hypoglycemia': 'low', 'health': 'early_stable'}
+    MIDDLE = {'self_care': 'limited', 'hypoglycemia': 'risk', 'health': 'moderate'}
+    FRAIL = {'self_care': 'dependent', 'hypoglycemia': 'severe_history', 'health': 'major_impact'}
+
+    def check(self, value, profile, mark, *texts, metric='空腹血糖', **extra):
+        item = {**self.FASTING, 'metric': metric, 'value': value, **extra}
+        result = grade(item, profile)
+        self.assertEqual(result['mark'], mark, result['verdict'])
+        full = assessment(item, profile)
+        for text in texts:
+            self.assertIn(text, full)
+        return full
+
+    def test_diagnosed_older_fasting_7_8_without_band(self):
+        result = self.check(7.8, self.OLDER, '🟡', '良好档、过渡档超过', '可接受档在内', '看医生定哪一档', '表4', ASK_GOAL, '如果是 2 型')
+        self.assertNotIn('不管按哪一档', result)
+
+    def test_diagnosed_adult_fasting_7_8_and_after_meal_9(self):
+        confirmed = {'general_goal_applicable': True}
+        self.check(7.8, self.ADULT, '🔴', '超过', '4.4–7.0', '表6', **confirmed)
+        for metric in ('餐后2小时血糖', '非空腹血糖'):
+            self.check(9, self.ADULT, '✅', '＜10.0', '表6', metric=metric, **confirmed)
+            self.check(10.0, self.ADULT, '🔴', metric=metric, **confirmed)
+        self.check(7.0, self.ADULT, '✅', **confirmed)
+        self.check(4.4, self.ADULT, '✅', **confirmed)
+        self.check(4.2, self.ADULT, '🟡', '低于', **confirmed)
+
+    def test_diagnosed_older_after_meal(self):
+        self.check(9, self.OLDER, '✅', '不管按哪一档都在内', metric='餐后2小时血糖')
+        self.check(11, self.OLDER, '🟡', '良好档超过', '过渡档、可接受档在内', metric='餐后2小时血糖')
+        self.check(13.9, self.OLDER, '🔴', '不管按哪一档都超过', metric='餐后2小时血糖')
+        self.check(11, self.OLDER, '🟡', '饭后 2 小时', metric='非空腹血糖')
+
+    def test_older_bands_give_different_answers(self):
+        for answers, mark, label in ((self.HEALTHY, '🔴', '良好'), (self.MIDDLE, '🔴', '过渡'), (self.FRAIL, '✅', '可接受')):
+            with self.subTest(label=label):
+                self.check(7.8, {**self.OLDER, 'older_diabetes': answers}, mark, f'「{label}」档')
+        for answers, mark in ((self.HEALTHY, '🔴'), (self.MIDDLE, '✅'), (self.FRAIL, '✅')):
+            self.check(11, {**self.OLDER, 'age_band': '80+', 'older_diabetes': answers}, mark, metric='餐后2小时血糖')
+
+    def test_older_fasting_boundaries(self):
+        self.check(8.5, self.OLDER, '🔴', '不管按哪一档都超过')
+        self.check(7.0, self.OLDER, '✅', '不管按哪一档都在内')
+        self.check(5.2, self.OLDER, '🟡', '低于')
+        self.check(4.0, self.OLDER, '🟡', '低于')
+        self.check(7.5, self.OLDER, '🟡', '可接受档在内')
+
+    def test_not_diagnosed_is_not_judged_by_diagnostic_cutoffs(self):
+        for conditions in ([], ['高血压'], ['糖尿病前期']):
+            for age in ('20-59', '65-79'):
+                profile = {**BASE, 'age_band': age, 'conditions': conditions}
+                with self.subTest(conditions=conditions, age=age):
+                    result = self.check(7.8, profile, '⚪', '没有确诊糖尿病', '问开单医生', general_goal_applicable=True)
+                    for word in ('4.4', '表4', '表6'):
+                        self.assertNotIn(word, result)
+                    self.check(7.8, profile, '🔴', '本张报告', reference={'min': 3.9, 'max': 6.1})
+                    self.check(3.0, profile, '⚪')
+
+    def test_low_glucose_comes_first_even_with_personal_goal(self):
+        goal = {'空腹血糖': {'op': '<', 'value': 7.0, 'unit': 'mmol/L'}}
+        for profile in (self.OLDER, self.ADULT, {**self.OLDER, 'targets': goal},
+                        {**GENERAL, 'conditions': ['1型糖尿病']}):
+            self.check(3.8, profile, '🔴', '低血糖', '15–20 g', '打 120', '第77–78页')
+        self.assertNotIn('低血糖：', assessment({**self.FASTING, 'value': 3.9}, self.OLDER))
+
+    def test_goal_type_unit_and_timing_limits(self):
+        goal = {'空腹血糖': {'op': '<', 'value': 8.0, 'unit': 'mmol/L'}}
+        self.check(7.8, {**self.OLDER, 'targets': goal}, '✅', '医生个人目标')
+        self.check(7.8, {**self.OLDER, 'conditions': ['1型糖尿病']}, '🟡', ASK_GOAL)
+        self.check(140, self.OLDER, '🟡', '单位', unit='mg/dL')
+        self.check(7.8, self.OLDER, '🟡', '空腹还是饭后', metric='血糖', reference={'min': 3.9, 'max': 11.1})
+        for change in ({}, {'general_goal_applicable': False}):
+            self.check(7.8, self.ADULT, '🟡', ASK_GOAL, reference={'min': 3.9, 'max': 6.1}, **change)
+        self.check(7.8, {**self.ADULT, 'conditions': ['2型糖尿病', '慢性肾病']}, '🟡', ASK_GOAL, general_goal_applicable=True)
+
+
 class LocalFixture(unittest.TestCase):
     def setUp(self):
         folder = tempfile.TemporaryDirectory()
@@ -507,6 +587,31 @@ class ReportLayoutTests(LocalFixture):
         self.assertNotIn('400', result)
 
 
+class GlucoseReportTests(LocalFixture):
+    def test_low_glucose_leads_the_report(self):
+        low = {'metric': '空腹血糖', 'unit': 'mmol/L', 'value': 3.2, 'date': '2026-10-01'}
+        result = self.run_cli('review', data={'context': {'age_band': '65-79', 'conditions': ['糖尿病']},
+                                              'measurements': [{**PRESSURE, 'value': 170}, low]})
+        first = result.splitlines()[0]
+        self.assertIn('低血糖', first)
+        self.assertIn('打 120', first)
+        self.assertTrue(result.rstrip().endswith('以医生意见为准'))
+
+    def test_low_glucose_does_not_wait_for_age(self):
+        low = {'metric': '空腹血糖', 'unit': 'mmol/L', 'value': 3.2, 'date': '2026-10-01'}
+        result = self.run_cli('review', data={'context': {'conditions': ['糖尿病']}, 'measurements': [low]})
+        self.assertIn('低血糖', result.splitlines()[0])
+        self.assertIn('这位家人多大年纪', result)
+        self.assertNotIn('|', result)
+        for data in ({'measurements': [low]}, {'context': {'conditions': ['糖尿病']}, 'measurements': [{**low, 'value': 7.8}]}):
+            self.assertNotIn('低血糖', self.run_cli('review', data=data))
+
+    def test_after_meal_metric_accepted_by_local_input(self):
+        item = {'metric': '餐后2小时血糖', 'unit': 'mmol/L', 'value': 11, 'date': '2026-10-01'}
+        result = self.run_cli('review', data={'context': {'age_band': '80+', 'conditions': ['2型糖尿病']}, 'measurements': [item]})
+        self.assertIn('看医生定哪一档', result)
+
+
 class SkillTextTests(unittest.TestCase):
     TEXT = (ROOT / 'SKILL.md').read_text(encoding='utf-8')
 
@@ -526,6 +631,14 @@ class SkillTextTests(unittest.TestCase):
                 self.assertIn(phrase, rule)
         self.assertIn('**整张报告或多项指标**用完整版', self.TEXT)
         self.assertIn('没有内容的块整块删掉', self.TEXT)
+
+    def test_glucose_rules_and_description_match(self):
+        description = next(line for line in self.TEXT.splitlines() if line.startswith('description:'))
+        for phrase in ('糖化血红蛋白', '已确诊糖尿病', '空腹', '血糖', '不判断是不是糖尿病'):
+            self.assertIn(phrase, description)
+        for phrase in ('确诊', '低于 3.9', '15–20 g', '4.4–7.0', '低于 10.0', '5.0–不到 7.5', '5.6–不到 8.5', '11.1', '13.9', '没确诊', '诊断切点'):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.TEXT)
 
     def test_required_rules_present(self):
         for phrase in ('按意思判断', '口语', '脚本没报警不代表没有急症', '说话不清', '嘴歪', '只解读这次、不存档，不想继续就说一声',
