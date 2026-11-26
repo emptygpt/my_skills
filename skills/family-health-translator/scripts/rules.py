@@ -96,10 +96,23 @@ EMERGENCY = re.compile('|'.join((
     rf'(?:大便|粪便|便便|拉的屎|屎)(?:的)?(?:颜色)?(?:{FILL}|发|像){{0,4}}(?:黑色|黑的|黑乎乎|黑得|发黑|黑)',
     r'呼吸困难|喘不上气|喘不过气|上不来气|透不过气|憋得喘不',
 )))
+# 第六版补的卒中口语。这几类词常用来说老毛病，只有这一组按分句排除既往和假设说法。
+STROKE_WORDS = re.compile('|'.join((
+    r'没(?:有|了)?知觉|失去(?:了)?知觉',
+    rf'(?:{SIDE_ONLY}|{SIDE}{LIMB}|手|胳膊|胳臂){FILL}{{0,3}}麻(?![烦药醉将辣花婆酱油利雀团袋])',
+    r'(?<![不得])(?:迷糊|迷迷糊糊)',
+    r'(?:突发|突然|忽然)(?:了|性)?(?:脑梗|中风|脑卒中)',
+)))
+PAST = re.compile(r'平时|平常|长期|多年|几年|几个月|老是|总是|经常|常常|以前|从前|过去|去年|前年|年前|个月前|'
+                  r'[0-9一二三四五六七八九十]\s*月|有一?天|那次|那天|当时|上次|既往|病史|后遗症|有过|得过')
+# 「高血压好几年突然……」里的旧病只是背景，后面的发作是现在的事；「三年前突然……」不算。
+NOW = re.compile(r'现在|目前|今天|今早|刚|这会|又|好好的|好端端|(?:高血压|血压高|糖尿病|病史|多年|几年|年了)了?(?:突然|忽然)')
+NOT_HAPPENING = re.compile(r'预防|担心|害怕|会不会|万一|对.{0,10}迷糊|(?:看|听|搞|弄|整|说)得.{0,4}迷糊')
 URGENT_FEVER = re.compile(r'高[热烧].{0,6}(?:不退|持续|反复)|持续.{0,5}高[热烧]')
 FALL_PAUSE = re.compile(r'((?:突发|突然|忽然).{0,8}(?:头晕|眩晕))[，,](?=.{0,6}(?:跌倒|摔倒|摔了一跤|摔了|站不稳))')
 NEGATED = re.compile(r'(?:没有|并无|从无|否认|未见|未出现|无|没|不伴|不是)(?:出现|发生|过|什么|任何)*[：: ]*$')
 NOT_NEGATED = re.compile(r'(?:不是没有|不能排除|不确定有没有|不只是|不止|不只)[：: ]*$')
+SHEET_RANGE = '本张报告印明的参考范围（不是治疗目标）'
 LOW_GLUCOSE_ACTION = ('低血糖：低于 3.9 mmol/L。人清醒就马上吃 15–20 g 葡萄糖或含糖食物，15 分钟后复测，并马上联系医生；'
                       '叫不醒或突然糊涂马上打 120')
 ACUTE = '请立即联系当地急救（中国大陆拨打 120）或前往急诊，不要等线上解读。'
@@ -119,8 +132,10 @@ def confirmed_conditions(profile):
 def triage(text):
     text = FALL_PAUSE.sub(r'\1 ', normalized(text))
     clauses = re.split(r'[，,。！？!?；;\n]|但(?:是)?|不过(?!气)|然而', text)
-    for pattern, advice in ((EMERGENCY, ACUTE), (URGENT_FEVER, FEVER)):
+    for pattern, advice in ((EMERGENCY, ACUTE), (STROKE_WORDS, ACUTE), (URGENT_FEVER, FEVER)):
         for clause in clauses:
+            if pattern is STROKE_WORDS and (NOT_HAPPENING.search(clause) or PAST.search(clause) and not NOW.search(clause)):
+                continue
             for match in pattern.finditer(clause):
                 prefix = clause[:match.start()]
                 if NOT_NEGATED.search(prefix) or not NEGATED.search(prefix):
@@ -227,7 +242,7 @@ def rule_for(item, profile):
             return {'ldl_limit': None}, LIPIDS
         return {'ldl_limit': LDL_LIMITS[risk]}, LIPIDS
     if 'reference' in item:
-        return item['reference'], '本张报告印明的参考范围（不是治疗目标）'
+        return item['reference'], SHEET_RANGE
     group = profile.get('sex'), '60-79' if age in ('60-64', '65-79') else age
     renal_metric = {'血清肌酐': ('μmol/L', 0), '血清尿素': ('mmol/L', 1)}.get(name)
     if renal_metric and item.get('lab_range_applicable') is True and group in RENAL_RANGES and unit == renal_metric[0]:

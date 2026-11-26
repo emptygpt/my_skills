@@ -12,7 +12,7 @@ from datetime import date
 sys.dont_write_bytecode = True
 from rules import (
     BP_LIMITS, DISCLAIMER, EGFR, LDL, LDL_LIMITS, LDL_QUESTION, LOW_GLUCOSE_ACTION, METRICS, OLDER_AGES, OLDER_ANSWERS,
-    NO_TREND, PERSONAL_GOAL_QUESTION, RED_FLAGS, T_SCORE, confirmed_conditions, grade, low_glucose, medication_notes, normalized,
+    NO_TREND, PERSONAL_GOAL_QUESTION, RED_FLAGS, SHEET_RANGE, T_SCORE, confirmed_conditions, grade, low_glucose, medication_notes, normalized,
     trend, triage,
 )
 
@@ -30,6 +30,9 @@ SCOPES = ('adult', 'minor', 'pregnant', 'unknown')
 CONSENT = '我确认资料本人已单独同意：仅为本机报告整理与趋势比较，保存代称、年龄段、性别、病史、用药、过敏、医生目标及指标记录；可随时查看、修改、删除。'
 OLDER_CONSENT = '新增保存老年糖尿病分层答案或医生确认的血脂风险档前，再向本人单独说明并征得同意。'
 MAX_BYTES = 2_000_000
+MEASUREMENT_FIELDS = {'metric', 'unit', 'value', 'date', 'reference', 'series', 'lab_range_applicable',
+                      'general_goal_applicable', 'bp_context', 'older_bp_applicable', 'ldl_baseline',
+                      'dxa_applicable', 'dxa_population_confirmed'}
 
 
 class InputError(ValueError):
@@ -96,10 +99,7 @@ def check_profile(profile):
 
 
 def check_measurement(item):
-    core = {'metric', 'unit', 'value', 'date'}
-    fields(item, core | {'reference', 'series', 'lab_range_applicable', 'general_goal_applicable', 'bp_context',
-                        'older_bp_applicable', 'ldl_baseline', 'dxa_applicable',
-                        'dxa_population_confirmed'}, core)
+    fields(item, MEASUREMENT_FIELDS, ('metric', 'unit', 'value', 'date'))
     unit_for(item['metric'], item['unit'])
     number(item['value'], minimum=-1_000_000_000 if item['metric'] == T_SCORE else 0)
     day = item['date']
@@ -127,6 +127,15 @@ def check_measurement(item):
     for key in ('dxa_applicable', 'dxa_population_confirmed'):
         if key in item:
             require(item['metric'] == T_SCORE and type(item[key]) is bool, 'DXA T 值适用性必须为布尔值。')
+
+
+def unsupported(item):
+    """脚本没有的项目整条跳过，只回显通过格式检查的项目名；支持项目的单位和数值照旧严格核对。"""
+    if not isinstance(item, dict) or isinstance(item.get('metric'), str) and item['metric'] in METRICS:
+        return False
+    fields(item, MEASUREMENT_FIELDS, ('metric',))
+    name(item['metric'])
+    return True
 
 
 def profile_path(args):
@@ -207,6 +216,8 @@ def ask_age(items, profile):
     conditions = profile.get('conditions', [])
     if isinstance(items, list) and isinstance(conditions, list) and all(isinstance(entry, str) for entry in conditions):
         for item in items if conditions else []:
+            if unsupported(item):
+                continue
             check_measurement(item)
             if low_glucose(item, profile):
                 return f'{LOW_GLUCOSE_ACTION}。\n\n{AGE_QUESTION}\n\n{DISCLAIMER}'
@@ -254,7 +265,11 @@ def review(data, args):
     require(isinstance(items, list) and len(items) <= 50, '指标必须是列表，每次最多 50 条。')
     results = []
     pending = []
+    skipped = []
     for item in items:
+        if unsupported(item):
+            skipped.append(item['metric'])
+            continue
         check_measurement(item)
         results.append((item, grade(item, profile), trend(item, history)))
         row = {key: item[key] for key in ('date', 'metric', 'value', 'unit', 'series') if key in item}
@@ -262,16 +277,17 @@ def review(data, args):
             pending.append(row)
     table = medication_table(data, profile) if data.get('schedule') else None
     reminders = []
-    if older and (any(item['metric'] == EGFR for item in items) or confirmed_conditions(profile) & {'慢性肾病', '慢性肾脏疾病', '肾功能不全'}):
+    compared = [item['metric'] for item, _, _ in results]
+    if older and (EGFR in compared or confirmed_conditions(profile) & {'慢性肾病', '慢性肾脏疾病', '肾功能不全'}):
         reminders.append('- 肾功能下降时，有些药的剂量需要由医生核对；复诊把药盒和报告带上，不自己调药。')
-    if older and (any(item['metric'] == T_SCORE for item in items) or confirmed_conditions(profile) & {'骨质疏松', '跌倒史', '骨折史'}):
+    if older and (T_SCORE in compared or confirmed_conditions(profile) & {'骨质疏松', '跌倒史', '骨折史'}):
         reminders.append('- 如果曾摔倒或轻轻一摔就骨折，复诊时告诉医生；问问怎样防跌倒、哪些情况要及时就诊。')
     reminders.extend(f'- {note}' for note in medication_notes(profile))
     if profile.get('allergies'):
         reminders.append('- 复诊时告诉医生已知的药物过敏史。')
     if args.persist and pending:
         save(path, {**record, 'history': history + pending})
-    return report(profile, results, table, reminders, bool(args.persist and pending))
+    return report(profile, results, table, reminders, bool(args.persist and pending), list(dict.fromkeys(skipped)))
 
 
 def conclusion(results):
@@ -285,10 +301,16 @@ def conclusion(results):
         return f'{"、".join(found["🟡"])}要医生定目标或补信息才能判断；其余能对照的项没有超出线。'
     if found['✅']:
         extra = '另有项目本工具看不了；' if found['⚪'] else ''
-        return f'能对照的项都在范围内；{extra}这不代表没有病，也不能排除急症。'
+        where = '单子范围内' if by_sheet(results) else '范围内'
+        return f'能对照的项都在{where}；{extra}这不代表没有病，也不能排除急症。'
     if found['⚪']:
         return '这次的指标缺少可对照的标准，本工具不判断高低。'
     return '这次没有收到确认过的指标。'
+
+
+def by_sheet(results):
+    """打 ✅ 的项是否全部只按单子上的范围比对。"""
+    return all(result['source'] == SHEET_RANGE for _, result, _ in results if result['mark'] == '✅')
 
 
 def cell(item, result):
@@ -300,20 +322,28 @@ def cell(item, result):
     return f'| 🔴 | **{item["metric"]}** | **{f"{value} {arrow}".strip()}** | {detail} | {NEXT_STEP["🔴"]} |'
 
 
-def report(profile, results, table, reminders, saved):
+def report(profile, results, table, reminders, saved, skipped=()):
     age = profile['age_band']
     older = age in OLDER_AGES
     lane = {'80+': '按 80 岁及以上看', '60-79': '按 60–79 岁看（旧档需细分，才能用老年血压目标）'}.get(
         age, f'按 {age.replace("-", "–")} 岁看' if older else '按一般成人（18–59 岁）看')
     status = '指标已按授权记录到本地档案' if saved else '本次未新增档案记录'
     days = '、'.join(sorted({item['date'] for item, _, _ in results}))
-    blocks = [f'**{conclusion(results)}**\n{" · ".join(part for part in (status, lane, days) if part)}']
+    headline = conclusion(results)
+    if skipped:
+        omitted = f'这些没比：{"、".join(skipped)}（脚本不支持，请看原单箭头和范围，问开单医生）。'
+        if any(result['urgent'] for _, result, _ in results):
+            headline = f'{headline}{omitted}'
+        else:
+            headline = f'{omitted}{headline if results else "这次没有脚本能比的项目。"}'
+    blocks = [f'**{headline}**\n{" · ".join(part for part in (status, lane, days) if part)}']
     rows = [cell(item, result) for mark in MARKS if mark != '✅' for item, result, _ in results if result['mark'] == mark]
     green = '；'.join(f'{item["metric"]} {item["value"]} {item["unit"]}（{result["verdict"]}）'
                      for item, result, _ in results if result['mark'] == '✅')
     if green:
         position = sum(result['mark'] in ('🔴', '🟡') for _, result, _ in results)
-        rows.insert(position, f'| ✅ | 在对照范围内 | {green} | | |')
+        label = '在单子范围内' if by_sheet(results) else '在对照范围内'
+        rows.insert(position, f'| ✅ | {label} | {green} | | |')
     if rows:
         blocks.append('| | 项目 | 这次 | 对照 | 怎么办 |\n|---|---|---|---|---|\n' + '\n'.join(rows))
         changed = [f'{item["metric"]}{change}' for item, _, change in results if change != NO_TREND]
