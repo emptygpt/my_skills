@@ -17,12 +17,36 @@ BASE = {'alias': '示例甲', 'age_band': '60-79', 'sex': '男', 'conditions': [
         'medications': [], 'allergies': [], 'targets': {}}
 URATE = {'metric': '血尿酸', 'unit': 'μmol/L', 'date': '2026-10-01', 'value': 400,
          'reference': {'min': 210, 'max': 420}, 'series': 'same-lab'}
+GENERAL = {**BASE, 'age_band': '20-59'}
+PRESSURE = {'metric': '收缩压', 'unit': 'mmHg', 'date': '2026-10-01', 'value': 138,
+            'bp_context': 'clinic', 'general_goal_applicable': True}
+HBA1C = {'metric': '糖化血红蛋白', 'unit': '%', 'date': '2026-10-01', 'value': 7.0,
+         'general_goal_applicable': True}
+ASK_GOAL = '这项要按医生给你家人定的目标看，复诊时问一句：我的目标是多少？'
 
 
 class RulesTests(unittest.TestCase):
     def test_same_report_different_person(self):
         self.assertIn('在参考区间内', assessment(URATE, BASE))
         self.assertIn('未达到此目标。采用 ＜360', assessment(URATE, {**BASE, 'conditions': ['痛风']}))
+
+    def test_clinic_pressure_initial_target_and_strict_boundaries(self):
+        profile = {**GENERAL, 'conditions': ['高血压']}
+        self.assertIn('符合此目标。采用 ＜140', assessment(PRESSURE, profile))
+        self.assertIn('未达到此目标。采用 ＜140', assessment({**PRESSURE, 'value': 140}, profile))
+        diastolic = {**PRESSURE, 'metric': '舒张压', 'value': 90}
+        self.assertIn('未达到此目标。采用 ＜90', assessment(diastolic, profile))
+        self.assertIn('符合此目标。采用 ＜90', assessment({**diastolic, 'value': 89}, profile))
+        self.assertIn(ASK_GOAL, assessment({**PRESSURE, 'bp_context': 'home'}, profile))
+        self.assertIn(ASK_GOAL, assessment({**PRESSURE, 'bp_context': 'unknown'}, profile))
+
+    def test_a1c_requires_confirmed_type_two_and_applicability(self):
+        profile = {**GENERAL, 'conditions': ['2 型糖尿病']}
+        self.assertIn('未达到此目标。采用 ＜7.0', assessment(HBA1C, profile))
+        self.assertIn('符合此目标。采用 ＜7.0', assessment({**HBA1C, 'value': 6.9}, profile))
+        self.assertIn(ASK_GOAL, assessment(HBA1C, {**profile, 'conditions': ['糖尿病']}))
+        self.assertIn(ASK_GOAL, assessment({**HBA1C, 'general_goal_applicable': False}, profile))
+        self.assertNotIn('＜7.0', assessment(HBA1C, GENERAL))
 
     def test_tophi_strict_boundary(self):
         profile = {**BASE, 'conditions': ['痛风', '痛风石']}
@@ -83,6 +107,43 @@ class LocalFlowTests(unittest.TestCase):
 
     def create(self, profile=BASE):
         self.run_cli('create', '--person', 'demo', '--scope', 'adult', '--consent', data=profile)
+
+    def test_markdown_profile_matches_local_archive(self):
+        markdown = (ROOT / 'references' / '解读与档案.md').read_text(encoding='utf-8')
+        template = json.loads(markdown.split('```json\n', 1)[1].split('```', 1)[0])
+        self.create(template['profile'])
+        data = {'scope': 'adult', 'measurements': template['history']}
+        result = self.run_cli('review', '--person', 'demo', '--persist', data=data)
+        self.assertIn('未达到此目标。采用 ＜360', result)
+        self.assertEqual(json.loads(self.run_cli('show', '--person', 'demo')), template)
+
+    def test_same_bp_and_a1c_use_different_profiles(self):
+        for item, condition, limit, expected, personal_limit, personal_expected in (
+            (PRESSURE, '高血压', '140', '符合此目标', 130, '未达到此目标'),
+            (HBA1C, '2型糖尿病', '7.0', '未达到此目标', 7.5, '符合此目标'),
+        ):
+            with self.subTest(metric=item['metric']):
+                general_id, personal_id = ('bp-general', 'bp-personal') if condition == '高血压' else ('a1c-general', 'a1c-personal')
+                reference = {'min': 0, 'max': item['value']}
+                data = {'scope': 'adult', 'measurements': [{**item, 'reference': reference}]}
+                profile = {**GENERAL, 'conditions': [condition]}
+                self.run_cli('create', '--person', general_id, '--scope', 'adult', '--consent', data=profile)
+                self.assertIn(f'{expected}。采用 ＜{limit}', self.run_cli('review', '--person', general_id, '--persist', data=data))
+                saved = json.loads(self.run_cli('show', '--person', general_id))['history'][0]
+                self.assertEqual(set(saved), {'date', 'metric', 'value', 'unit'})
+                personal = {**profile, 'age_band': '60-79', 'targets': {
+                    item['metric']: {'op': '<', 'value': personal_limit, 'unit': item['unit']}}}
+                self.run_cli('create', '--person', personal_id, '--scope', 'adult', '--consent', data=personal)
+                result = self.run_cli('review', '--person', personal_id, data=data)
+                self.assertIn(f'{personal_expected}。采用 ＜{personal_limit}', result)
+                self.assertIn('医生个人目标', result)
+                self.assertNotIn(ASK_GOAL, result)
+                for fields in ({'age_band': '60-79'}, {'age_band': '未知'}, {'conditions': [condition, '慢性肾病']}):
+                    self.run_cli('update', '--person', general_id, data={**profile, **fields})
+                    result = self.run_cli('review', '--person', general_id, data=data)
+                    questions = result.split('## ③')[1].split('## ④')[0]
+                    self.assertIn(ASK_GOAL, questions)
+                    self.assertNotIn('在参考区间内', result)
 
     def test_help(self):
         self.assertIn('health.py', self.run_cli('--help'))

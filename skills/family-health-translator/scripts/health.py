@@ -10,7 +10,7 @@ import tempfile
 from datetime import date
 
 sys.dont_write_bytecode = True
-from rules import DISCLAIMER, METRICS, RED_FLAGS, assessment, medication_note, normalized, trend, triage
+from rules import BP_LIMITS, DISCLAIMER, METRICS, PERSONAL_GOAL_QUESTION, RED_FLAGS, assessment, medication_note, normalized, trend, triage
 
 
 AGE_BANDS = ('18-19', '20-59', '60-79', '80+', '未知')
@@ -78,7 +78,7 @@ def check_profile(profile):
 
 def check_measurement(item):
     core = {'metric', 'unit', 'value', 'date'}
-    fields(item, core | {'reference', 'series', 'lab_range_applicable'}, core)
+    fields(item, core | {'reference', 'series', 'lab_range_applicable', 'general_goal_applicable', 'bp_context'}, core)
     unit_for(item['metric'], item['unit'])
     number(item['value'])
     day = item['date']
@@ -93,6 +93,10 @@ def check_measurement(item):
         require(interval['min'] <= interval['max'], '报告参考区间上下限颠倒。')
     if 'lab_range_applicable' in item:
         require(type(item['lab_range_applicable']) is bool, '实验室适用性必须为布尔值。')
+    if 'general_goal_applicable' in item:
+        require(type(item['general_goal_applicable']) is bool, '一般成人目标适用性必须为布尔值。')
+    if 'bp_context' in item:
+        require(item['metric'] in BP_LIMITS and item['bp_context'] in ('clinic', 'home', 'ambulatory', 'unknown'), '请核对血压测量场景。')
 
 
 def profile_path(args):
@@ -190,14 +194,19 @@ def review(data, args):
     require(isinstance(items, list) and len(items) <= 50, '指标必须是列表，每次最多 50 条。')
     lines = []
     pending = []
+    goals_to_ask = []
     for item in items:
         check_measurement(item)
-        lines.append(f'- {item["metric"]} {item["value"]} {item["unit"]}（{item["date"]}）：{assessment(item, profile)} {trend(item, history)}')
+        comparison = assessment(item, profile)
+        if comparison.endswith(PERSONAL_GOAL_QUESTION) and item['metric'] not in goals_to_ask:
+            goals_to_ask.append(item['metric'])
+        lines.append(f'- {item["metric"]} {item["value"]} {item["unit"]}（{item["date"]}）：{comparison} {trend(item, history)}')
         row = {key: item[key] for key in ('date', 'metric', 'value', 'unit', 'series') if key in item}
         if row not in history and row not in pending:
             pending.append(row)
     table = medication_table(data, profile)
-    questions = ['- 这次结果在我的情况下应看哪个目标，什么时候复查？']
+    questions = [f'- {"、".join(goals_to_ask)}：{PERSONAL_GOAL_QUESTION}'] if goals_to_ask else [
+        '- 这次结果在我的情况下应看哪个目标，什么时候复查？']
     note = medication_note(profile)
     if note:
         questions.append(f'- {note}')
@@ -211,7 +220,7 @@ def review(data, args):
         '## ② 大字版用药时间表\n\n' + table,
         '## ③ 下次复诊的问题\n\n' + '\n'.join(questions),
         '## ④ 哪些情况要立刻就医\n\n' + RED_FLAGS,
-        '## ⑤ 可以念给家人听\n\n这只是把单子和医生已经交代的事情整理了一遍，不是诊断。带着原单问医生哪些要复查，药按现行医嘱，不自己改。',
+        '## ⑤ 可以念给家人听\n\n这张单子咱们先收好。下次去医院，咱们带上原单，问医生哪些要再查、你的目标是多少。药还是照医生现在交代的吃，咱们不自己改。',
         DISCLAIMER,
     ))
 

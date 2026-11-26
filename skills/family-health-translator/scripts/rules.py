@@ -5,6 +5,11 @@ from decimal import Decimal
 
 DISCLAIMER = '以医生意见为准'
 GOUT = '《中国高尿酸血症与痛风诊疗指南（2019）》问题3（DOI: 10.3760/cma.j.issn.1000-6699.2020.01.001）'
+HYPERTENSION = '《中国高血压防治指南（2024年修订版）》5.1.3 要点5C（一般患者诊室目标；是否进一步降压由医生判断）'
+DIABETES = '《中国糖尿病防治指南（2024版）》第六章一、表6（一般成人2型糖尿病目标）'
+PERSONAL_GOAL_QUESTION = '这项要按医生给你家人定的目标看，复诊时问一句：我的目标是多少？'
+BP_LIMITS = {'收缩压': 140, '舒张压': 90}
+DIABETES_TYPES = {'糖尿病', '1型糖尿病', '2型糖尿病', '其他类型糖尿病'}
 RENAL = 'WS/T 404.5—2015 表1及第5章'
 ACR = '《2020 ACR 痛风管理指南》表8（DOI: 10.1002/acr.24180）'
 METRICS = {
@@ -53,7 +58,7 @@ def triage(text):
 
 def rule_for(item, profile):
     name, unit = item['metric'], item['unit']
-    conditions = set(profile.get('conditions', []))
+    conditions = {normalized(condition).replace(' ', '') for condition in profile.get('conditions', [])}
     goal = profile.get('targets', {}).get(name)
     if goal:
         source = '档案中的医生个人目标（本人确认；非通用阈值）'
@@ -67,9 +72,18 @@ def rule_for(item, profile):
             '慢性肾病', '慢性肾脏疾病', '肾结石', '高血压', '糖尿病', '2型糖尿病',
             '血脂异常', '脑卒中', '缺血性心脏病', '心力衰竭', '痛风发病年龄小于40岁',
         }):
-            return None, '存在需个别判断的痛风情况；请用医生个人目标，不自动套用一般痛风目标。'
+            return None, f'存在需个别判断的痛风情况，不自动套用一般痛风目标。{PERSONAL_GOAL_QUESTION}'
         stricter = conditions.intersection({'痛风石', '痛风每年至少发作2次', '慢性痛风性关节炎'})
         return {'op': '<', 'value': 300 if stricter else 360, 'unit': unit}, GOUT
+    general = profile.get('age_band') in ('18-19', '20-59') and item.get('general_goal_applicable') is True
+    if name in BP_LIMITS and conditions.intersection({'高血压'} | DIABETES_TYPES):
+        if general and conditions == {'高血压'} and unit == 'mmHg' and item.get('bp_context') == 'clinic':
+            return {'op': '<', 'value': BP_LIMITS[name], 'unit': unit}, HYPERTENSION
+        return None, PERSONAL_GOAL_QUESTION
+    if name == '糖化血红蛋白' and conditions.intersection(DIABETES_TYPES):
+        if general and conditions == {'2型糖尿病'} and unit == '%':
+            return {'op': '<', 'value': 7.0, 'unit': unit}, DIABETES
+        return None, PERSONAL_GOAL_QUESTION
     if 'reference' in item:
         return item['reference'], '本张报告印明的参考范围（不是治疗目标）'
     group = profile.get('sex'), profile.get('age_band')
